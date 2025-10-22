@@ -1,0 +1,119 @@
+from __future__ import annotations
+
+import os
+from typing import Any, List
+from urllib.parse import urljoin
+
+import httpx
+
+from lfx.base.embeddings.model import LCEmbeddingsModel
+from lfx.field_typing import Embeddings
+# 🔧 Unifique a origem dos Inputs para evitar assinaturas diferentes
+from lfx.io import DropdownInput, SecretStrInput, StrInput
+
+
+def _default_proxy_v1_base() -> str:
+    """Build default /v1 base from env or localhost."""
+    origin = os.getenv("LITELLM_PROXY_API_BASE", "http://localhost:4000").rstrip("/")
+    return f"{origin}/v1"
+
+
+class LiteLLMEmbeddingsComponent(LCEmbeddingsModel):
+    """Embeddings component that talks to a LiteLLM proxy (OpenAI-compatible)."""
+
+    display_name: str | None = "LiteLLM Embeddings"
+    description: str | None = "Generate embeddings via a LiteLLM proxy (OpenAI-compatible)."
+    icon = "LiteLLM"
+
+    def update_build_config(
+        self,
+        build_config: dict,
+        field_value: Any,
+        field_name: str | None = None,  # noqa: ARG002
+    ):
+        """Populate 'model' options by calling the LiteLLM /v1/models endpoint."""
+        if field_name == "model":
+            # build_config["base_url"] geralmente é um dict do Input com {value, load_from_db, ...}
+            base_url_dict = build_config.get("base_url", {}) or {}
+            base_url_value: str | None = None
+
+            if isinstance(base_url_dict, dict):
+                # Se o valor vier do DB, algumas plataformas resolvem isso automaticamente.
+                # Para manter o método síncrono, não chamamos métodos async aqui.
+                base_url_value = base_url_dict.get("value") or None
+
+            if not base_url_value:
+                base_url_value = _default_proxy_v1_base()
+
+            models = self.get_model(base_url_value)
+            # Garante que a chave 'model' exista e seja um dict mutável
+            if "model" not in build_config or not isinstance(build_config["model"], dict):
+                build_config["model"] = {}
+            build_config["model"]["options"] = models  # lista de ids
+
+        return build_config  # a classe base espera um dict/dotdict
+
+    @staticmethod
+    def get_model(base_url_value: str) -> List[str]:
+        """Fetch available models from LiteLLM's /v1/models (síncrono)."""
+        try:
+            url = urljoin(base_url_value, "/v1/models")
+            with httpx.Client() as client:
+                response = client.get(url, timeout=5.0)
+                response.raise_for_status()
+                data = response.json()
+                items = data.get("data", [])
+                return [m.get("id") for m in items if isinstance(m, dict) and "id" in m]
+        except Exception as e:  # noqa: BLE001
+            msg = (
+                "Could not retrieve models from the LiteLLM proxy. "
+                "Please ensure the proxy is running and reachable, and that the base URL is correct."
+            )
+            raise ValueError(msg) from e
+
+    inputs = [
+        DropdownInput(
+            name="model",
+            display_name="Model",
+            advanced=False,
+            refresh_button=True,
+            required=True,
+        ),
+        # 🔧 Use StrInput (do mesmo módulo) para evitar assinatura conflitante
+        StrInput(
+            name="base_url",
+            display_name="LiteLLM Base URL",
+            advanced=False,
+            value=_default_proxy_v1_base(),
+            required=True,
+        ),
+        SecretStrInput(
+            name="api_key",
+            display_name="LiteLLM API Key",
+            advanced=True,
+            # value opcionalmente vazio; pode vir de env/secret manager
+        ),
+    ]
+
+    def build_embeddings(self) -> Embeddings:
+        """Create an Embeddings instance wired to the LiteLLM proxy."""
+        try:
+            from langchain_openai import OpenAIEmbeddings
+        except ImportError as e:  # pragma: no cover
+            msg = (
+                "Please install 'langchain-openai' to use LiteLLM Embeddings.\n"
+                "Example: pip install langchain-openai"
+            )
+            raise ImportError(msg) from e
+
+        api_key = self.api_key or os.getenv("LITELLM_PROXY_API_KEY", "")
+
+        try:
+            return OpenAIEmbeddings(
+                model=self.model,
+                base_url=self.base_url,  # LiteLLM proxy endpoint (OpenAI-compatible)
+                api_key=api_key,
+            )
+        except Exception as e:  # noqa: BLE001
+            msg = f"Could not connect to the LiteLLM proxy for embeddings. Error: {e}"
+            raise ValueError(msg) from e
